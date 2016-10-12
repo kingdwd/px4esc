@@ -136,9 +136,11 @@ struct BeepCommand
 
 struct Context
 {
+    using VoltageModulator = ThreePhaseVoltageModulator<IdqMovingAverageLength>;
+
     Observer observer;
 
-    ThreePhaseVoltageModulator<IdqMovingAverageLength> modulator;
+    VoltageModulator modulator;
 
     CurrentSetpointController current_controller;
 
@@ -152,7 +154,17 @@ struct Context
 
     Scalar inverter_power = 0;                                 ///< Watt, updated from the main IRQ
 
-    Scalar remaining_time_before_stall_detection_enabled = 0;
+    struct SpinupState
+    {
+        Scalar time = 0;
+
+        enum class State
+        {
+            Acceleration,
+            Synchronization,
+            SoftHandOff
+        } state = State::Acceleration;
+    } spinup_state;
 
     Context(const ObserverParameters& observer_params,
             Const field_flux,
@@ -609,92 +621,73 @@ void handleMainIRQ(Const period)
                                                          g_context->reference_Iq,
                                                          g_context->angular_velocity);
 
-                if (g_context->remaining_time_before_stall_detection_enabled > 0)
+                // Stopping if the angular velocity is too low
+                if (std::abs(g_context->angular_velocity) < g_motor_params.min_electrical_ang_vel)
                 {
-                    // We've just entered the running mode, stall detection is temporarily suppressed
-                    g_context->remaining_time_before_stall_detection_enabled -= period;
-                }
-                else
-                {
-                    // Stopping if the angular velocity is too low
-                    if (std::abs(g_context->angular_velocity) < g_motor_params.min_electrical_ang_vel)
-                    {
-                        g_state = State::Idle;      // We'll possibly switch back to spinup from idle later
-                        g_num_successive_rotor_stalls++;
-                    }
+                    g_state = State::Idle;      // We'll possibly switch back to spinup from idle later
+                    g_num_successive_rotor_stalls++;
                 }
             }
             else
             {
-                Const variable_delta = period / g_motor_params.nominal_spinup_duration;
-
                 // Direction change requests and current setpoint initialization
                 if (((g_setpoint > 0) != (g_context->reference_Iq > 0)) ||
                     os::float_eq::closeToZero(g_context->reference_Iq))
                 {
                     g_context->reference_Iq = std::copysign(g_motor_params.spinup_current, g_setpoint);
                     g_context->angular_velocity = 0;
+                    g_context->spinup_state.state = Context::SpinupState::State::Acceleration;
                 }
 
-                // Steady acceleration
-                g_context->angular_velocity += std::copysign(g_motor_params.min_electrical_ang_vel * variable_delta,
-                                                             g_setpoint);
+                g_context->spinup_state.time += period;
 
-                // Observer synchronization
-                if (std::abs(g_context->angular_velocity) > g_motor_params.min_electrical_ang_vel)
+                switch (g_context->spinup_state.state)
                 {
-                    // Current adjustment
+                case Context::SpinupState::State::Acceleration:
+                {
+                    g_context->angular_velocity += std::copysign(
+                            g_motor_params.min_electrical_ang_vel * (period / g_motor_params.nominal_spinup_duration),
+                            g_setpoint);
+
+                    if (std::abs(g_context->angular_velocity) > g_motor_params.min_electrical_ang_vel)
                     {
-                        Scalar dI = g_motor_params.max_current * variable_delta;
-
-                        if (std::abs(g_context->observer.getAngularVelocity()) > std::abs(g_context->angular_velocity))
-                        {
-                            // Decrease current if the observer reports higher speed, increase otherwise
-                            dI = -dI;
-                        }
-
-                        if (g_setpoint < 0)
-                        {
-                            // We're spinning in the opposite direction, all signs flipped
-                            dI = -dI;
-                        }
-
-                        g_context->reference_Iq =
-                            math::Range<>(-g_motor_params.max_current, g_motor_params.max_current).
-                            constrain(g_context->reference_Iq + dI);
+                        g_context->spinup_state.state = Context::SpinupState::State::Synchronization;
+                        g_context->spinup_state.time = 0;
                     }
+                    break;
+                }
 
-                    // Evaluating the observer synchronization precision
+                case Context::SpinupState::State::Synchronization:
+                {
                     Const ang_pos_error = math::subtractAngles(g_context->observer.getAngularPosition(),
                                                                g_context->angular_position);
                     Const ang_vel_rel_error =
                         std::abs(g_context->observer.getAngularVelocity() - g_context->angular_velocity) /
                         std::abs(g_context->angular_velocity);
 
-                    // Decision to hand-off control to the normal mode.
                     // Not sure if the hardcoded thresholds are okay.
-                    const bool ang_pos_ok = std::abs(ang_pos_error) < math::convertDegreesToRadian(20.0F);
+                    const bool ang_pos_ok = std::abs(ang_pos_error) < math::convertDegreesToRadian(30.0F);
                     const bool ang_vel_ok = ang_vel_rel_error < 0.1F;
                     if (ang_vel_ok && ang_pos_ok)
                     {
-                        g_state = State::Running;
-                        g_context->remaining_time_before_stall_detection_enabled =
-                            g_motor_params.nominal_spinup_duration;
+                        g_context->spinup_state.state = Context::SpinupState::State::SoftHandOff;
+                        g_context->spinup_state.time = 0;
                     }
+
+                    if (g_context->spinup_state.time > g_motor_params.nominal_spinup_duration)
+                    {
+                        g_num_successive_rotor_stalls++;
+                        g_setpoint = 0;     // Stopping
+                    }
+                    break;
                 }
 
-                // Fault detection
-                const math::Range<> abs_current_range(g_motor_params.min_current, g_motor_params.max_current);
-
-                Const max_angular_velocity = g_motor_params.min_electrical_ang_vel * 3.0F; // FIXME hardcoded constant
-
-                const bool failed = !abs_current_range.contains(std::abs(g_context->reference_Iq)) ||
-                                    std::abs(g_context->angular_velocity) > max_angular_velocity;
-
-                if (failed)
+                case Context::SpinupState::State::SoftHandOff:
                 {
-                    g_num_successive_rotor_stalls++;
-                    g_setpoint = 0;     // Stopping
+                    g_context->angular_velocity = g_context->observer.getAngularVelocity();
+                    g_context->angular_position = g_context->observer.getAngularPosition();
+                    break;
+                }
                 }
             }
         }
@@ -708,6 +701,7 @@ void handleMainIRQ(Const period)
         g_debug_tracer.set<6>((g_state == State::Spinup) ?
                               g_context->angular_velocity :
                               g_context->inverter_power / board::motor::getInverterVoltage());
+#if 0
         {
             static Scalar prev_Iq = Idq[1];
             Const Iq_gradient = (Idq[1] - prev_Iq) / period;
@@ -715,6 +709,7 @@ void handleMainIRQ(Const period)
             g_debug_tracer.set<4>((Udq[1] - g_motor_params.rs * Idq[1] - g_motor_params.lq * Iq_gradient) /
                                   (g_motor_params.lq * Idq[0] + g_motor_params.phi));
         }
+#endif
 
         /*
          * Updating setpoint and handling termination condition.
@@ -777,45 +772,59 @@ void handleFastIRQ(Const period,
     if (g_state == State::Running ||
         g_state == State::Spinup)
     {
+        Context::VoltageModulator::Output output;
+
         if (g_state == State::Running)
         {
-            const auto output = g_context->modulator.onNextPWMPeriod(phase_currents_ab,
-                                                                     inverter_voltage,
-                                                                     g_context->angular_velocity,
-                                                                     g_context->angular_position,
-                                                                     g_context->reference_Iq);
-            g_pwm_handle.setPWM(output.pwm_setpoint);
-
-            g_context->estimated_Idq = output.estimated_Idq;
-            g_context->reference_Udq = output.reference_Udq;
-            g_context->angular_position = output.extrapolated_angular_position;
+            output = g_context->modulator.onNextPWMPeriod(phase_currents_ab,
+                                                          inverter_voltage,
+                                                          g_context->angular_velocity,
+                                                          g_context->angular_position,
+                                                          g_context->reference_Iq);
+            g_debug_tracer.set<4>(g_context->reference_Iq);
         }
         else
         {
-            g_context->angular_position =
-                constrainAngularPosition(g_context->angular_position + g_context->angular_velocity * period);
+            Context::VoltageModulator::SoftHandoffState soft_handoff;
 
-            Const angle_sine   = math::sin(g_context->angular_position);
-            Const angle_cosine = math::cos(g_context->angular_position);
-
-            const auto estimated_I_alpha_beta = performClarkeTransform(phase_currents_ab);
-            g_context->estimated_Idq = performParkTransform(estimated_I_alpha_beta, angle_sine, angle_cosine);
-
-            g_context->reference_Udq = {
+            soft_handoff.reference_Udq = {
                 0.0F,
                 std::min(g_motor_params.spinup_current * g_motor_params.rs * 1.5F,
                          computeLineVoltageLimit(inverter_voltage, 0.8F))       // TODO FIXME 0.8
             };
 
-            const auto reference_U_alpha_beta = performInverseParkTransform(g_context->reference_Udq,
-                                                                            angle_sine,
-                                                                            angle_cosine);
+            if (g_context->spinup_state.state == Context::SpinupState::State::SoftHandOff)
+            {
+                Const time_based = g_context->spinup_state.time / g_motor_params.nominal_spinup_duration;
+                Const speed_based =
+                    (std::abs(g_context->angular_velocity) - g_motor_params.min_electrical_ang_vel) /
+                    (g_motor_params.min_electrical_ang_vel);
 
-            const auto pwm_setpoint_and_sector_number = performSpaceVectorTransform(reference_U_alpha_beta,
-                                                                                    inverter_voltage);
+                soft_handoff.innovation_weight = std::max(time_based, speed_based);
 
-            g_pwm_handle.setPWM(pwm_setpoint_and_sector_number.first);
+                if (soft_handoff.innovation_weight >= 1.0F)
+                {
+                    // Done, we're in the normal mode now
+                    g_state = State::Running;
+                    g_context->spinup_state.state = Context::SpinupState::State::Acceleration;
+                    g_context->spinup_state.time = 0;
+                }
+            }
+
+            output = g_context->modulator.onNextPWMPeriod(phase_currents_ab,
+                                                          inverter_voltage,
+                                                          g_context->angular_velocity,
+                                                          g_context->angular_position,
+                                                          g_context->reference_Iq,
+                                                          &soft_handoff);
+            g_debug_tracer.set<4>(soft_handoff.innovation_weight);
         }
+
+        g_pwm_handle.setPWM(output.pwm_setpoint);
+
+        g_context->estimated_Idq = output.estimated_Idq;
+        g_context->reference_Udq = output.reference_Udq;
+        g_context->angular_position = output.extrapolated_angular_position;
 
         g_debug_tracer.set<0>(g_context->reference_Udq[0]);
         g_debug_tracer.set<1>(g_context->reference_Udq[1]);

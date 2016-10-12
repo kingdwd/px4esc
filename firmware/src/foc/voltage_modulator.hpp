@@ -60,7 +60,8 @@ public:
 
     Scalar computeVoltage(Const target_current,
                           Const real_current,
-                          Const inverter_voltage)
+                          Const inverter_voltage,
+                          Const ki_multiplier = 1.0F)
     {
         Const voltage_limit = inverter_voltage * (SquareRootOf3 / 2.0F);
         const math::Range<> voltage_limits(-voltage_limit, voltage_limit);
@@ -68,7 +69,7 @@ public:
         static constexpr math::Range<> UnityLimits(-1.0F, 1.0F);
         Const error = UnityLimits.constrain((target_current - real_current) / full_scale_current_);
 
-        ui_ = voltage_limits.constrain(ui_ + ki_ * error);      // Sdelat' hotel grozu,
+        ui_ = voltage_limits.constrain(ui_ + ki_multiplier * ki_ * error);      // Sdelat' hotel grozu,
 
         return kp_ * (error + ui_);                             // a poluchil kozu
     }
@@ -118,6 +119,12 @@ public:
         bool Udq_was_limited = false;
     };
 
+    struct SoftHandoffState
+    {
+        math::Vector<2> reference_Udq{};
+        Scalar innovation_weight = 0;
+    };
+
     ThreePhaseVoltageModulator(Const Lq,
                                Const Rs,
                                Const max_current,
@@ -136,7 +143,8 @@ public:
                            Const inverter_voltage,
                            Const angular_velocity,
                            Const angular_position,
-                           Const reference_Iq)
+                           Const reference_Iq,
+                           const SoftHandoffState* const soft_hand_off = nullptr)
     {
         Output out;
 
@@ -157,13 +165,39 @@ public:
         /*
          * Running PIDs, estimating reference voltage in the rotating reference frame
          */
-        out.reference_Udq[0] = pid_Id_.computeVoltage(0.0F,
-                                                      out.estimated_Idq[0],
-                                                      inverter_voltage);
+        if (soft_hand_off != nullptr &&
+            soft_hand_off->innovation_weight < 0.9999F)
+        {
+            assert(soft_hand_off->innovation_weight >= 0.0F);
 
-        out.reference_Udq[1] = pid_Iq_.computeVoltage(reference_Iq,
-                                                      out.estimated_Idq[1],
-                                                      inverter_voltage);
+            constexpr Scalar IntegratorEnableThreshold = 0.5F;
+
+            Const ki_multiplier = std::max(0.0F, soft_hand_off->innovation_weight - IntegratorEnableThreshold);
+
+            out.reference_Udq[0] = pid_Id_.computeVoltage(0.0F,
+                                                          out.estimated_Idq[0],
+                                                          inverter_voltage,
+                                                          ki_multiplier);
+
+            out.reference_Udq[1] = pid_Iq_.computeVoltage(reference_Iq,
+                                                          out.estimated_Idq[1],
+                                                          inverter_voltage,
+                                                          ki_multiplier);
+
+            out.reference_Udq =
+                (soft_hand_off->reference_Udq * (1.0F - soft_hand_off->innovation_weight)) +
+                (out.reference_Udq * soft_hand_off->innovation_weight);
+        }
+        else
+        {
+            out.reference_Udq[0] = pid_Id_.computeVoltage(0.0F,
+                                                          out.estimated_Idq[0],
+                                                          inverter_voltage);
+
+            out.reference_Udq[1] = pid_Iq_.computeVoltage(reference_Iq,
+                                                          out.estimated_Idq[1],
+                                                          inverter_voltage);
+        }
 
         Const Udq_magnitude_limit = computeLineVoltageLimit(inverter_voltage, PWMLimit);
 
